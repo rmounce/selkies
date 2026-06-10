@@ -1153,6 +1153,7 @@ export class Input {
         this._scrollMagnitude = 10;
         this.cursorScaleFactor = null;
         this._cursorBase64Data = null;
+        this._hasReceivedVisibleServerCursor = false;
 
         this._guacKeyboardID = Input._nextGuacID++;
         this._EVENT_MARKER = '_GUAC_KEYBOARD_HANDLED_BY_' + this._guacKeyboardID;
@@ -1225,6 +1226,18 @@ export class Input {
         this._updateCursorPosition(this._latestMouseX, this._latestMouseY);
     }
 
+    async _loadCursorImageBitmap() {
+        if (this._cursorImageBitmap || !this._cursorBase64Data) {
+            return;
+        }
+        const cursorBase64Data = this._cursorBase64Data;
+        const blob = await (await fetch(`data:image/png;base64,${cursorBase64Data}`)).blob();
+        const imageBitmap = await createImageBitmap(blob);
+        if (this._cursorBase64Data === cursorBase64Data) {
+            this._cursorImageBitmap = imageBitmap;
+        }
+    }
+
     _handleOutsideClick(event) {
         if (!this.use_browser_cursors && !this.element.contains(event.target)) {
             this.cursorDiv.style.display = 'none';
@@ -1240,7 +1253,8 @@ export class Input {
 
     _updateBrowserCursor() {
         if (!this._cursorBase64Data) {
-            this.element.style.setProperty('cursor', 'none', 'important');
+            const fallback = this._hasReceivedVisibleServerCursor ? 'none' : 'default';
+            this.element.style.setProperty('cursor', fallback, 'important');
             return;
         }
         const cursorDataUrl = `data:image/png;base64,${this._cursorBase64Data}`;
@@ -1255,14 +1269,16 @@ export class Input {
             this._cursorImageBitmap = null;
             this._cursorBase64Data = null;
             this.cursorDiv.style.display = 'none';
-            if (this.use_browser_cursors) {
-                this.element.style.setProperty('cursor', 'none', 'important');
+            if (this.inputAttached) {
+                const fallback = this._hasReceivedVisibleServerCursor ? 'none' : 'default';
+                this.element.style.setProperty('cursor', fallback, 'important');
             }
             return;
         }
         this._rawHotspotX = parseInt(cursorData.hotx) || 0;
         this._rawHotspotY = parseInt(cursorData.hoty) || 0;
         this._cursorBase64Data = cursorData.curdata;
+        this._hasReceivedVisibleServerCursor = true;
         if (!this.inputAttached) {
             this.cursorDiv.style.display = 'none';
             this.element.style.cursor = 'auto';
@@ -1272,11 +1288,15 @@ export class Input {
             this.cursorDiv.style.display = 'none';
             this._updateBrowserCursor();
         } else {
-            const blob = await (await fetch(`data:image/png;base64,${this._cursorBase64Data}`)).blob();
-            this._cursorImageBitmap = await createImageBitmap(blob);
-            this.element.style.setProperty('cursor', 'none', 'important');
-            this.cursorDiv.style.display = 'block';
-            this._drawAndScaleCursor();
+            await this._loadCursorImageBitmap();
+            if (this._cursorImageBitmap) {
+                this.element.style.setProperty('cursor', 'none', 'important');
+                this.cursorDiv.style.display = 'block';
+                this._drawAndScaleCursor();
+            } else {
+                this.cursorDiv.style.display = 'none';
+                this.element.style.setProperty('cursor', 'default', 'important');
+            }
         }
     }
 
@@ -1625,9 +1645,12 @@ export class Input {
         if (this.buttonMask === 0 && event.target !== this.element) {
             return;
         }
-        if (this.inputAttached && !this.use_browser_cursors) {
+        if (this.inputAttached && !this.use_browser_cursors && this._cursorImageBitmap) {
             this.cursorDiv.style.display = 'block';
             this.element.style.setProperty('cursor', 'none', 'important');
+        } else if (this.inputAttached && !this.use_browser_cursors) {
+            this.cursorDiv.style.display = 'none';
+            this.element.style.setProperty('cursor', 'default', 'important');
         }
         let visualClientX = event.clientX;
         let visualClientY = event.clientY;
@@ -1985,15 +2008,13 @@ export class Input {
             this._updateBrowserCursor();
         } else {
             this.element.style.setProperty('cursor', 'none', 'important');
-            if (this._cursorBase64Data && !this._cursorImageBitmap) {
-                const blob = await (await fetch(`data:image/png;base64,${this._cursorBase64Data}`)).blob();
-                this._cursorImageBitmap = await createImageBitmap(blob);
-            }
+            await this._loadCursorImageBitmap();
             if (this._cursorImageBitmap) {
                 this.cursorDiv.style.display = 'block';
                 this._drawAndScaleCursor();
             } else {
                 this.cursorDiv.style.display = 'none';
+                this.element.style.setProperty('cursor', 'default', 'important');
             }
         }
     }
@@ -2500,13 +2521,25 @@ export class Input {
     attach_context() {
         if (this.inputAttached) return;
         this._windowMath();
-        this.element.style.setProperty('cursor', 'none', 'important');
-        if (this._cursorImageBitmap || this._cursorBase64Data) {
-            if (this.use_browser_cursors) {
-                this._updateBrowserCursor();
-            } else {
-                this.cursorDiv.style.display = 'block';
-                this._drawAndScaleCursor();
+        if (this.use_browser_cursors) {
+            this._updateBrowserCursor();
+        } else if (this._cursorImageBitmap) {
+            this.element.style.setProperty('cursor', 'none', 'important');
+            this.cursorDiv.style.display = 'block';
+            this._drawAndScaleCursor();
+        } else {
+            this.cursorDiv.style.display = 'none';
+            this.element.style.setProperty('cursor', 'default', 'important');
+            if (this._cursorBase64Data) {
+                this._loadCursorImageBitmap().then(() => {
+                    if (this.inputAttached && !this.use_browser_cursors && this._cursorImageBitmap) {
+                        this.element.style.setProperty('cursor', 'none', 'important');
+                        this.cursorDiv.style.display = 'block';
+                        this._drawAndScaleCursor();
+                    }
+                }).catch((error) => {
+                    console.error('Failed to load cursor image:', error);
+                });
             }
         }
         this.listeners_context.push(addListener(window, 'keydown', this._handleKeyDown, this, true));
