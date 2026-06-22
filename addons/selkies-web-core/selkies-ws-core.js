@@ -2230,6 +2230,16 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       await decoder.configure(decoderConfig);
       console.log('Main VideoDecoder configured successfully with config:', decoderConfig);
+      // Shared viewers join an in-progress, infinite-GOP stream and can only start
+      // decoding from a keyframe. The server forces one on connect, but that IDR
+      // can arrive (and be dropped) before this async configure() completes. Now
+      // that the decoder is ready, explicitly ask the server for a fresh keyframe
+      // if we haven't decoded one yet, closing that race deterministically.
+      if (isSharedMode && !mainDecoderHasKeyframe &&
+          websocket && websocket.readyState === WebSocket.OPEN) {
+        console.log("Shared mode: decoder configured without a keyframe yet; requesting one.");
+        websocket.send("REQUEST_KEYFRAME");
+      }
       return true;
     } catch (e) {
       initiateFallback(e, 'main_decoder_configure');
