@@ -1317,6 +1317,26 @@ class DataStreamingServer:
             data_logger.info(f"Broadcasting primary stream resolution to all clients: {message_str}")
             websockets.broadcast(self.clients, message_str)
 
+    def request_primary_idr(self, reason: str = "") -> bool:
+        """
+        Ask the primary capture's encoder to emit a fresh IDR (key) frame on its
+        next produced frame. Used to sync a newly-connected viewer. Returns True
+        if the request was issued. Harmless to existing viewers (an ordinary IDR).
+        """
+        primary_capture = self.capture_instances.get('primary')
+        if not primary_capture:
+            return False
+        capture_module = primary_capture.get('module')
+        if not (capture_module and hasattr(capture_module, 'request_idr_frame')):
+            return False
+        try:
+            capture_module.request_idr_frame()
+            data_logger.info(f"Requested IDR keyframe{(' (' + reason + ')') if reason else ''}.")
+            return True
+        except Exception as e_idr:
+            data_logger.warning(f"Failed to request IDR keyframe: {e_idr}")
+            return False
+
     def _parse_settings_payload(self, payload_str: str) -> dict:
         settings_data = json.loads(payload_str)
         parsed = {}
@@ -1994,6 +2014,7 @@ class DataStreamingServer:
                         allowed_viewer_prefixes = [
                             "SETTINGS,",
                             "START_VIDEO",
+                            "REQUEST_KEYFRAME",
                             "js,",
                         ]
                         if active_mk_token and perms.get("token") == active_mk_token:
@@ -2149,16 +2170,10 @@ class DataStreamingServer:
                                 # delta frames until it sees a keyframe. Ask the encoder for a fresh
                                 # IDR so it can begin decoding promptly instead of waiting for the
                                 # next natural keyframe. This is an ordinary IDR -- existing viewers
-                                # decode it without disruption.
-                                primary_capture = self.capture_instances.get('primary')
-                                if primary_capture:
-                                    capture_module = primary_capture.get('module')
-                                    if capture_module and hasattr(capture_module, 'request_idr_frame'):
-                                        try:
-                                            capture_module.request_idr_frame()
-                                            data_logger.info("Requested IDR keyframe to sync newly-connected viewer.")
-                                        except Exception as e_idr:
-                                            data_logger.warning(f"Failed to request IDR keyframe for new viewer: {e_idr}")
+                                # decode it without disruption. The client also re-requests once its
+                                # decoder is actually configured (REQUEST_KEYFRAME), which closes the
+                                # race where this IDR arrives before the async decoder is ready.
+                                self.request_primary_idr("sync newly-connected viewer")
 
                                 continue
 
@@ -2403,6 +2418,12 @@ class DataStreamingServer:
                                 await websocket.send("VIDEO_STOPPED")
                             except websockets.ConnectionClosed:
                                 pass
+
+                    elif message == "REQUEST_KEYFRAME":
+                        # Sent by a shared/viewer client once its video decoder is
+                        # actually configured, so the forced IDR can't arrive before
+                        # the decoder is ready to consume it.
+                        self.request_primary_idr(f"client request {websocket.remote_address}")
 
                     elif message == "START_AUDIO":
                         async def _handle_start_audio_request():
