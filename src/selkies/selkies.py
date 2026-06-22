@@ -2349,8 +2349,16 @@ class DataStreamingServer:
                                 await self.reconfigure_displays()
                                 await websocket.send("VIDEO_STARTED")
                         else:
-                            data_logger.info(f"Received START_VIDEO from a shared client ({websocket.remote_address}). Triggering reconfiguration.")
-                            await self.reconfigure_displays()
+                            if self.capture_instances:
+                                # Pipeline already running — viewer just needs the current
+                                # stream state, which the SETTINGS handler already sent.
+                                data_logger.info(
+                                    f"Received START_VIDEO from shared client {websocket.remote_address}. "
+                                    f"Pipeline already active; skipping reconfiguration."
+                                )
+                            else:
+                                data_logger.info(f"Received START_VIDEO from a shared client ({websocket.remote_address}). Triggering reconfiguration.")
+                                await self.reconfigure_displays()
 
                     elif message == "STOP_VIDEO":
                         if client_display_id and client_display_id in self.display_clients:
