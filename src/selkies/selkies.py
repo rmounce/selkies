@@ -12,6 +12,14 @@ FRAME_ID_SUSPICIOUS_GAP_THRESHOLD = (
     MAX_UINT16_FRAME_ID // 2
 )
 STALLED_CLIENT_TIMEOUT_SECONDS = 4.0
+# Per-viewer send-buffer watermarks for the primary broadcast path. websockets.broadcast
+# has no flow control, so a viewer whose downlink can't keep up accumulates unbounded
+# bytes in its transport buffer (server memory growth + latency that never drains, since
+# a requested keyframe queues behind the backlog). When a viewer's buffered bytes exceed
+# HIGH we stop sending video to it; once it drains below LOW we resync it with a fresh
+# keyframe. These are per-connection and don't touch other viewers.
+PRIMARY_SEND_BUFFER_HIGH_WATER_BYTES = 4 * 1024 * 1024
+PRIMARY_SEND_BUFFER_LOW_WATER_BYTES = 512 * 1024
 RTT_SMOOTHING_SAMPLES = 20
 SENT_FRAME_TIMESTAMP_HISTORY_SIZE = 1000
 TARGET_FRAMERATE = 60
@@ -846,6 +854,8 @@ class DataStreamingServer:
             None
         )
         self.clients = set()
+        # Primary viewers we've paused mid-stream because their send buffer backed up.
+        self._paused_primary_viewers = set()
         self.app = app
         self.cli_args = cli_args
         self.is_secure_mode = is_secure_mode
@@ -1336,6 +1346,31 @@ class DataStreamingServer:
         except Exception as e_idr:
             data_logger.warning(f"Failed to request IDR keyframe: {e_idr}")
             return False
+
+    async def _resync_one_primary_viewer(self, websocket):
+        """
+        Re-sync a single primary viewer after we paused it for send-buffer backpressure
+        and dropped frames to it. Closes that socket's keyframe gate (PIPELINE_RESETTING
+        to this socket only) and forces a fresh IDR so it resumes from a clean keyframe
+        rather than a broken delta chain. Mirrors the newly-connected-viewer sync path;
+        does not disturb other viewers.
+        """
+        primary = self.display_clients.get('primary')
+        try:
+            if primary and primary.get('width', 0) > 0 and primary.get('height', 0) > 0:
+                resolution_msg = json.dumps({
+                    "type": "stream_resolution",
+                    "width": primary['width'],
+                    "height": primary['height'],
+                })
+                await websocket.send(resolution_msg)
+            await websocket.send("PIPELINE_RESETTING primary")
+        except websockets.ConnectionClosed:
+            return
+        except Exception as e_resync:
+            data_logger.warning(f"Failed to resync paused primary viewer: {e_resync}")
+            return
+        self.request_primary_idr("resync viewer after send-buffer backpressure")
 
     def _parse_settings_payload(self, payload_str: str) -> dict:
         settings_data = json.loads(payload_str)
@@ -2643,9 +2678,10 @@ class DataStreamingServer:
             data_logger.info(f"Cleaning up Data WS handler for {raddr} (Display ID: {client_display_id})...")
 
             self.clients.discard(websocket)
+            self._paused_primary_viewers.discard(websocket)
             if self.data_ws is websocket:
                 self.data_ws = None
-            
+
             disconnected_display_id = None
             for disp_id, client_info in self.display_clients.items():
                 if client_info.get('ws') is websocket:
@@ -3120,8 +3156,44 @@ class DataStreamingServer:
                     if not primary_viewers:
                         queue.task_done()
                         continue
-                    now = time.monotonic()
+
+                    # Per-viewer send-buffer backpressure. websockets.broadcast applies no
+                    # flow control, so a viewer that can't keep up would accumulate unbounded
+                    # bytes in its transport buffer. Skip any viewer whose buffer is over the
+                    # high-water mark (drop frames for it only); once it drains below the
+                    # low-water mark, resync it with a fresh keyframe. Other viewers are
+                    # unaffected. Degrades safely to "send to all" if the transport doesn't
+                    # expose its buffer size.
+                    send_targets = []
                     for client_ws in primary_viewers:
+                        try:
+                            buffered = client_ws.transport.get_write_buffer_size()
+                        except Exception:
+                            buffered = 0
+                        if client_ws in self._paused_primary_viewers:
+                            if buffered <= PRIMARY_SEND_BUFFER_LOW_WATER_BYTES:
+                                self._paused_primary_viewers.discard(client_ws)
+                                data_logger.info(
+                                    f"Primary viewer {getattr(client_ws, 'remote_address', '?')} send buffer "
+                                    f"drained ({buffered}B); resyncing with a keyframe."
+                                )
+                                asyncio.create_task(self._resync_one_primary_viewer(client_ws))
+                            # Still draining (or just-triggered resync): don't send this frame.
+                            continue
+                        if buffered > PRIMARY_SEND_BUFFER_HIGH_WATER_BYTES:
+                            self._paused_primary_viewers.add(client_ws)
+                            data_logger.warning(
+                                f"Primary viewer {getattr(client_ws, 'remote_address', '?')} send buffer "
+                                f"{buffered}B > {PRIMARY_SEND_BUFFER_HIGH_WATER_BYTES}B; pausing video to it."
+                            )
+                            continue
+                        send_targets.append(client_ws)
+
+                    if not send_targets:
+                        queue.task_done()
+                        continue
+                    now = time.monotonic()
+                    for client_ws in send_targets:
                         for primary_client_info in self.display_clients.values():
                             if primary_client_info.get('ws') is client_ws:
                                 if primary_client_info.get('backpressure_enabled', True):
@@ -3131,8 +3203,8 @@ class DataStreamingServer:
                                         primary_client_info['sent_timestamps'].popitem(last=False)
                                 break
                     try:
-                        websockets.broadcast(primary_viewers, data_chunk)
-                        self._bytes_sent_in_interval += len(data_chunk) * len(primary_viewers)
+                        websockets.broadcast(send_targets, data_chunk)
+                        self._bytes_sent_in_interval += len(data_chunk) * len(send_targets)
                     except Exception as e:
                         data_logger.error(f"Error during primary broadcast: {e}")
 
