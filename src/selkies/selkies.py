@@ -1333,11 +1333,12 @@ class DataStreamingServer:
 
     def _ensure_global_stats_collectors(self):
         """
-        Start the system-wide stats collectors (CPU/RAM, GPU, network) once, shared by
-        all connected viewers. Idempotent: a collector is (re)started only if it isn't
-        currently running, so additional viewers add no collection overhead -- only their
-        own lightweight per-connection sender task. GPU sampling forks nvidia-smi, so this
-        keeps that to one process per interval regardless of viewer count.
+        Start the system-wide stats collectors (CPU/RAM, GPU, network) and the single
+        broadcaster once, shared by all connected viewers. Idempotent: a task is
+        (re)started only if it isn't currently running, so additional viewers add NO
+        stats overhead. GPU sampling forks nvidia-smi and the snapshot is identical for
+        every viewer, so this keeps both collection and serialization to one per interval
+        regardless of viewer count (the broadcaster serializes once and fans out).
         """
         if self._system_monitor_task_ws is None or self._system_monitor_task_ws.done():
             self._system_monitor_task_ws = asyncio.create_task(
@@ -1352,10 +1353,15 @@ class DataStreamingServer:
             self._network_monitor_task_ws = asyncio.create_task(
                 _collect_network_stats_ws(self._shared_stats_ws, self)
             )
+        if self._stats_sender_task_ws is None or self._stats_sender_task_ws.done():
+            self._stats_sender_task_ws = asyncio.create_task(
+                _broadcast_stats_periodically_ws(self)
+            )
 
     def _stop_global_stats_collectors(self):
-        """Cancel the shared stats collectors (called when the last client disconnects)."""
-        for _attr in ('_system_monitor_task_ws', '_gpu_monitor_task_ws', '_network_monitor_task_ws'):
+        """Cancel the shared stats collectors + broadcaster (last client disconnected)."""
+        for _attr in ('_system_monitor_task_ws', '_gpu_monitor_task_ws',
+                      '_network_monitor_task_ws', '_stats_sender_task_ws'):
             _task = getattr(self, _attr, None)
             if _task and not _task.done():
                 _task.cancel()
@@ -1787,7 +1793,6 @@ class DataStreamingServer:
         active_uploads_by_path_conn = {}
         active_upload_target_path_conn = None
         upload_dir_valid = upload_dir_path is not None
-        stats_sender_task_ws = None
         
         mic_setup_done = False 
         pa_module_index = None
@@ -1807,17 +1812,11 @@ class DataStreamingServer:
                 f"Data WS handler for {raddr}: Critical - self.input_handler (global) is not set. Input processing will fail."
             )
 
-        # System-wide collectors run once and are shared across all viewers. Only the
-        # sender is per-connection (it forwards the shared snapshot to this socket).
-        # The collector locals stay None so per-connection cleanup won't cancel the
-        # shared collectors; they're stopped only when the last client disconnects.
+        # System-wide stats collectors AND the broadcaster run once, shared across all
+        # viewers (collect once, serialize once, fan out). Nothing stats-related is
+        # per-connection now; the shared tasks are stopped only when the last client
+        # disconnects.
         self._ensure_global_stats_collectors()
-        stats_sender_task_ws = asyncio.create_task(
-            _send_stats_periodically_ws(
-                websocket, self._shared_stats_ws
-            )
-        )
-        self._stats_sender_task_ws = stats_sender_task_ws
 
         try:
             if PULSEAUDIO_AVAILABLE:
@@ -2716,18 +2715,9 @@ class DataStreamingServer:
             else:
                 data_logger.info(f"Unregistered client at {raddr} disconnected. No display reconfiguration needed.")
 
-            # Cancel only this connection's stats sender; the shared system-wide
-            # collectors keep running for any remaining viewers.
-            if stats_sender_task_ws and not stats_sender_task_ws.done():
-                stats_sender_task_ws.cancel()
-                try:
-                    await stats_sender_task_ws
-                except asyncio.CancelledError:
-                    pass
-
-            # When the last client disconnects, stop the shared collectors so we aren't
-            # sampling CPU/GPU (forking nvidia-smi) with nobody connected. They restart
-            # automatically on the next connection via _ensure_global_stats_collectors().
+            # When the last client disconnects, stop the shared stats tasks so we aren't
+            # sampling CPU/GPU (forking nvidia-smi) or broadcasting with nobody connected.
+            # They restart automatically on the next connection.
             if not self.clients:
                 self._stop_global_stats_collectors()
 
@@ -3500,35 +3490,28 @@ async def _collect_network_stats_ws(shared_data, server_instance, interval_secon
     except Exception as e:
         data_logger.error(f"Network monitor (WS) error: {e}", exc_info=True)
 
-async def _send_stats_periodically_ws(websocket, shared_data, interval_seconds=5):
+async def _broadcast_stats_periodically_ws(server_instance, interval_seconds=5):
+    """
+    Single shared task: serialize the system-wide stats snapshot ONCE per interval and
+    broadcast to all clients. The stats are identical for every viewer, so this replaces
+    the former per-connection senders (which each re-serialized the same data) with one
+    serialize + one fan-out, independent of viewer count.
+    """
+    shared_data = server_instance._shared_stats_ws
     try:
         while True:
             await asyncio.sleep(interval_seconds)
-            # Read (don't pop) the shared snapshot: collectors are global and there is one
-            # sender per viewer, so popping would let whichever sender fires first consume
-            # the sample and starve the others. Each sender forwards the current snapshot.
-            system_stats = shared_data.get("system")
-            gpu_stats = shared_data.get("gpu")
-            network_stats = shared_data.get("network")
-            try:
-                if not websocket:  # Check if websocket is still valid
-                    data_logger.info("Stats sender: WS closed or invalid.")
-                    break
-                if system_stats:
-                    await websocket.send(json.dumps(system_stats))
-                if gpu_stats:
-                    await websocket.send(json.dumps(gpu_stats))
-                if network_stats:
-                    await websocket.send(json.dumps(network_stats))
-            except websockets.exceptions.ConnectionClosed:
-                data_logger.info("Stats sender: WS connection closed.")
-                break
-            except Exception as e_send:
-                data_logger.error(f"Stats sender: Error sending: {e_send}")
+            clients = server_instance.clients
+            if not clients:
+                continue
+            for key in ("system", "gpu", "network"):
+                snapshot = shared_data.get(key)
+                if snapshot:
+                    websockets.broadcast(clients, json.dumps(snapshot))
     except asyncio.CancelledError:
-        data_logger.info("Stats sender (WS) cancelled.")
+        data_logger.info("Stats broadcaster (WS) cancelled.")
     except Exception as e:
-        data_logger.error(f"Stats sender (WS) error: {e}", exc_info=True)
+        data_logger.error(f"Stats broadcaster (WS) error: {e}", exc_info=True)
 
 async def on_resize_handler(res_str, current_app_instance, data_server_instance=None, display_id='primary'):
     """
