@@ -145,6 +145,11 @@ if (authToken) {
 let sharedClientState = 'ready';
 let isSharedMode = detectedSharedModeType !== null;
 let sharedClientHasReceivedKeyframe = false;
+// Latency guard for slow (software) decoders: if the decoder's input queue backs up,
+// flush it and skip to a fresh keyframe rather than grinding through stale frames.
+let lastBacklogResyncMs = 0;
+const DECODE_BACKLOG_RESYNC_THRESHOLD = 10; // pending decodes before we skip ahead
+const BACKLOG_RESYNC_COOLDOWN_MS = 1500;    // min gap between skip-ahead resyncs
 
 if (isSharedMode) {
   console.log(`Client is running in ${detectedSharedModeType} mode.`);
@@ -2486,6 +2491,15 @@ document.addEventListener('DOMContentLoaded', () => {
         if ( (isSharedMode && sharedClientState === 'ready') || (!isSharedMode && isVideoPipelineActive) ) {
            const bufferLimit = 0;
            if (videoFrameBuffer.length > bufferLimit) {
+                // Latency over smoothness: the painter runs once per rAF (~60/s) and
+                // would otherwise drain a backlog one frame per tick, so any burst that
+                // pushes the buffer to depth N stays N frames behind forever. Instead,
+                // drop every stale frame and paint only the newest so end-to-end latency
+                // can never accumulate (we accept skipped frames during motion).
+                while (videoFrameBuffer.length > 1) {
+                    const staleFrame = videoFrameBuffer.shift();
+                    try { staleFrame?.close(); } catch (e) { /* already closed */ }
+                }
                 const frameToPaint = videoFrameBuffer.shift();
                 if (frameToPaint) {
                     if (canvas.width > 0 && canvas.height > 0) {
@@ -3067,6 +3081,29 @@ document.addEventListener('DOMContentLoaded', () => {
             if (decoder && decoder.state === 'configured') {
                 const chunkType = (video_frame_type_byte === 0x01) ? 'key' : 'delta';
                 if (chunkType === 'delta' && !mainDecoderHasKeyframe) {
+                    return;
+                }
+                // If the decoder has fallen behind (a slow software decode can't keep
+                // up during motion), its internal queue holds stale frames we can't drop
+                // individually under infinite-GOP H.264. Flush it and ask the server for
+                // a fresh keyframe so we skip straight to "now" instead of grinding
+                // through the backlog. Cooldown avoids thrashing if decode stays slow.
+                if (chunkType === 'delta' && decoder.decodeQueueSize > DECODE_BACKLOG_RESYNC_THRESHOLD) {
+                    const nowMs = performance.now();
+                    if (nowMs - lastBacklogResyncMs > BACKLOG_RESYNC_COOLDOWN_MS) {
+                        lastBacklogResyncMs = nowMs;
+                        console.warn(`Decode backlog (${decoder.decodeQueueSize} pending); flushing decoder and requesting keyframe to skip ahead.`);
+                        // Re-close the gate so incoming deltas are dropped until the keyframe.
+                        sharedClientHasReceivedKeyframe = false;
+                        // Drop any already-decoded frames waiting to paint.
+                        while (videoFrameBuffer.length > 0) {
+                            const staleFrame = videoFrameBuffer.shift();
+                            try { staleFrame?.close(); } catch (e) { /* already closed */ }
+                        }
+                        // Closes the current decoder (discarding its queued backlog),
+                        // reconfigures, and re-requests a keyframe on configure (line ~2238).
+                        triggerInitializeDecoder();
+                    }
                     return;
                 }
                 if (chunkType === 'key') {
