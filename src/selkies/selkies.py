@@ -2125,11 +2125,40 @@ class DataStreamingServer:
                                 data_logger.info(f"Viewer client {websocket.remote_address} sent initial SETTINGS. Syncing with current stream state.")
                                 if not initial_settings_processed:
                                     initial_settings_processed = True
-                                
-                                await self.broadcast_stream_resolution()
 
-                                data_logger.info(f"Broadcasting PIPELINE_RESETTING to sync new viewer.")
-                                websockets.broadcast(self.clients, "PIPELINE_RESETTING primary")
+                                # Sync ONLY the joining viewer. This previously broadcast to
+                                # self.clients, which tore down every existing viewer's decoder
+                                # (PIPELINE_RESETTING closes the shared keyframe gate and clears
+                                # the decoders) and froze their video until the next keyframe -- a
+                                # visible glitch for everyone each time any viewer connected.
+                                primary = self.display_clients.get('primary')
+                                if primary and primary.get('width', 0) > 0 and primary.get('height', 0) > 0:
+                                    resolution_msg = json.dumps({
+                                        "type": "stream_resolution",
+                                        "width": primary['width'],
+                                        "height": primary['height'],
+                                    })
+                                    data_logger.info(f"Syncing new viewer {websocket.remote_address}: resolution + PIPELINE_RESETTING (this socket only).")
+                                    try:
+                                        await websocket.send(resolution_msg)
+                                        await websocket.send("PIPELINE_RESETTING primary")
+                                    except websockets.ConnectionClosed:
+                                        pass
+
+                                # The new viewer starts with its keyframe gate closed and discards
+                                # delta frames until it sees a keyframe. Ask the encoder for a fresh
+                                # IDR so it can begin decoding promptly instead of waiting for the
+                                # next natural keyframe. This is an ordinary IDR -- existing viewers
+                                # decode it without disruption.
+                                primary_capture = self.capture_instances.get('primary')
+                                if primary_capture:
+                                    capture_module = primary_capture.get('module')
+                                    if capture_module and hasattr(capture_module, 'request_idr_frame'):
+                                        try:
+                                            capture_module.request_idr_frame()
+                                            data_logger.info("Requested IDR keyframe to sync newly-connected viewer.")
+                                        except Exception as e_idr:
+                                            data_logger.warning(f"Failed to request IDR keyframe for new viewer: {e_idr}")
 
                                 continue
 
