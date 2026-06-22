@@ -931,6 +931,10 @@ class DataStreamingServer:
         self.display_clients = {}
         self.video_chunk_queues = {}
         self.capture_instances = {}
+        # Persistent ScreenCapture objects, one per display_id.  Kept alive across
+        # reconfigure_displays() cycles so that the underlying NVENC/CUDA context is
+        # only initialised once instead of being re-created on every reconnect.
+        self._persistent_capture_modules = {}
 
         # pcmflux audio capture state
         self.audio_device_name = audio_device_name
@@ -2783,6 +2787,9 @@ class DataStreamingServer:
                 data_logger.error(f"Error on server.wait_closed(): {e_close}")
         self.server = None
         await self.shutdown_pipelines()
+        # Drop the persistent ScreenCapture modules so their NVENC/CUDA contexts
+        # can be released now that the server is going away.
+        self._persistent_capture_modules.clear()
         data_logger.info(f"Data WS on port {self.port} stop procedure complete.")
 
     async def _cleanup_client(self, websocket, display_id):
@@ -3174,7 +3181,14 @@ class DataStreamingServer:
             self.video_chunk_queues[display_id] = asyncio.Queue(maxsize=queue_size)
             sender_task = asyncio.create_task(self._video_chunk_sender(display_id))
             
-            capture_module = ScreenCapture()
+            if display_id not in self._persistent_capture_modules:
+                if not X11_CAPTURE_AVAILABLE:
+                    raise SelkiesAppError("ScreenCapture is not available because the pixelflux library is missing.")
+                self._persistent_capture_modules[display_id] = ScreenCapture()
+                data_logger.info(f"Created new ScreenCapture instance for '{display_id}'.")
+            else:
+                data_logger.info(f"Reusing existing ScreenCapture instance for '{display_id}' (CUDA context preserved).")
+            capture_module = self._persistent_capture_modules[display_id]
 
             if IS_WAYLAND:
                 if hasattr(capture_module, 'set_cursor_callback'):
