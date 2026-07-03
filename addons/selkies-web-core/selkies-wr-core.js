@@ -336,8 +336,10 @@ export default function webrtc() {
 	const isSharedMode = detectedSharedModeType !== null;
 	const isStrictViewer = detectedSharedModeType === "shared";
 
-	// Set storage key based on URL
-	const urlForKey = window.location.href.split('#')[0];
+	// Storage key namespace: origin + pathname only, NOT the full URL, so a per-session
+	// token in the query string can't leak a new localStorage namespace each session.
+	// Must match selkies-ws-core.js / selkies-core.js.
+	const urlForKey = window.location.origin + window.location.pathname;
 	const storageAppName = urlForKey.replace(/[^a-zA-Z0-9.-_]/g, '_');
 
 	const getIntParam = (key, default_value) => {
