@@ -153,6 +153,24 @@ let sharedClientHasReceivedKeyframe = false;
 // latency stays bounded to at most this many frames (~16ms each).
 const MAX_QUEUED_VIDEO_FRAMES = 1;
 
+// Latency guard for slow (software) decoders: if the decoder's input queue backs up,
+// reinitialize it and skip to a fresh keyframe rather than grinding through stale frames.
+let lastBacklogResyncMs = 0;
+const DECODE_BACKLOG_RESYNC_THRESHOLD = 10; // pending decodes before we skip ahead
+const BACKLOG_RESYNC_COOLDOWN_MS = 1500;    // min gap between skip-ahead resyncs
+
+// Debounced server IDR request (REQUEST_KEYFRAME): the server rate-limits per
+// display and per viewer socket, so pace requests client-side as well.
+let lastKeyframeRequestTime = 0;
+function requestKeyframe() {
+    const now = performance.now();
+    if (now - lastKeyframeRequestTime < (isSharedMode ? 1500 : 500)) return;
+    lastKeyframeRequestTime = now;
+    if (websocket && websocket.readyState === WebSocket.OPEN) {
+        websocket.send("REQUEST_KEYFRAME");
+    }
+}
+
 if (isSharedMode) {
   console.log(`Client is running in ${detectedSharedModeType} mode.`);
 }
@@ -3139,6 +3157,33 @@ function initWebsockets() {
             if (decoder && decoder.state === 'configured') {
                 const chunkType = (video_frame_type_byte === 0x01) ? 'key' : 'delta';
                 if (chunkType === 'delta' && !mainDecoderHasKeyframe) {
+                    return;
+                }
+                // If the decoder has fallen behind (a slow software decode can't keep
+                // up during motion), its internal queue holds stale frames we can't drop
+                // individually under infinite-GOP H.264. Reinitialize it and ask the
+                // server for a fresh keyframe so we skip straight to "now" instead of
+                // grinding through the backlog. Cooldown avoids thrashing if decode
+                // stays slow.
+                if (chunkType === 'delta' && decoder.decodeQueueSize > DECODE_BACKLOG_RESYNC_THRESHOLD) {
+                    const nowMs = performance.now();
+                    if (nowMs - lastBacklogResyncMs > BACKLOG_RESYNC_COOLDOWN_MS) {
+                        lastBacklogResyncMs = nowMs;
+                        console.warn(`Decode backlog (${decoder.decodeQueueSize} pending); reinitializing decoder and requesting keyframe to skip ahead.`);
+                        // Re-close the gate so incoming deltas are dropped until the keyframe.
+                        sharedClientHasReceivedKeyframe = false;
+                        // Drop any already-decoded frames waiting to paint.
+                        while (videoFrameBuffer.length > 0) {
+                            const staleFrame = videoFrameBuffer.shift();
+                            try { staleFrame?.close(); } catch (e) { /* already closed */ }
+                        }
+                        // Closes the current decoder (discarding its queued backlog) and
+                        // reconfigures; the early-keyframe stash (pendingSharedKeyframe)
+                        // catches the requested IDR if it arrives before the decoder is
+                        // reconfigured.
+                        triggerInitializeDecoder();
+                        requestKeyframe();
+                    }
                     return;
                 }
                 if (chunkType === 'key') {
