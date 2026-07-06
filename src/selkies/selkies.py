@@ -2580,8 +2580,21 @@ class DataStreamingServer(BaseStreamingService):
                                 await self.reconfigure_displays()
                                 await websocket.send_str("VIDEO_STARTED")
                         else:
-                            data_logger.info(f"Received START_VIDEO from a shared client ({remote_address}). Triggering reconfiguration.")
-                            await self.reconfigure_displays()
+                            # A shared client (re)joining needs only a decode entry point,
+                            # not a pipeline rebuild: reset just that client and request an
+                            # IDR from the running capture. Rebuild only if nothing runs.
+                            if 'primary' in self.capture_instances:
+                                data_logger.info(f"START_VIDEO from shared client ({remote_address}): sending reset + IDR.")
+                                try:
+                                    await websocket.send_str("PIPELINE_RESETTING primary")
+                                except (ConnectionResetError, OSError, RuntimeError):
+                                    pass
+                                self._schedule_idr_for_display('primary')
+                                # Shared clients clear their cursor canvas on tab hide too.
+                                await self.send_current_cursor(websocket, remote_address)
+                            else:
+                                data_logger.info(f"START_VIDEO from shared client ({remote_address}) with no active capture. Reconfiguring.")
+                                await self.reconfigure_displays()
 
                     elif message == "STOP_VIDEO":
                         if client_display_id and client_display_id in self.display_clients:
