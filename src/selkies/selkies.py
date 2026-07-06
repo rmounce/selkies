@@ -960,6 +960,7 @@ class DataStreamingServer(BaseStreamingService):
         self._last_bandwidth_calc_time = time.monotonic()
         # Frame-based backpressure settings
         self.last_start_video_request_times = {}
+        self.last_viewer_keyframe_request_times = {}
         self.allowed_desync_ms = BACKPRESSURE_ALLOWED_DESYNC_MS
         self.latency_threshold_for_adjustment_ms = BACKPRESSURE_LATENCY_THRESHOLD_MS
         self.backpressure_check_interval_s = BACKPRESSURE_CHECK_INTERVAL_S
@@ -974,6 +975,7 @@ class DataStreamingServer(BaseStreamingService):
         # reconfigure_displays() cycles so that the underlying NVENC/CUDA context is
         # only initialised once instead of being re-created on every reconnect.
         self._persistent_capture_modules = {}
+        self._last_keyframe_request = {}  # display_id -> monotonic, rate-limits client IDR requests
 
         # pcmflux audio capture state
         self.audio_device_name = self.cli_args.audio_device_name
@@ -1349,6 +1351,18 @@ class DataStreamingServer(BaseStreamingService):
             data_logger.info(f"New frame backpressure task started for display '{display_id}'.")
         else:
             data_logger.warning(f"Backpressure task for '{display_id}' was already running. Not starting a new one.")
+
+    def _schedule_idr_for_display(self, display_id: str):
+        """Ask the encoder for a fresh keyframe on this display, off the event loop."""
+        instance = self.capture_instances.get(display_id)
+        module = instance.get('module') if instance else None
+        if module and hasattr(module, 'request_idr_frame'):
+            # Non-blocking in pixelflux (an atomic flag / channel send), so it can run
+            # inline; a keyframe request is idempotent.
+            try:
+                module.request_idr_frame()
+            except Exception:
+                pass
 
     async def _run_frame_backpressure_logic(self, display_id: str):
         """The core backpressure and latency calculation loop for a single display."""
@@ -2225,6 +2239,7 @@ class DataStreamingServer(BaseStreamingService):
                         allowed_viewer_prefixes = [
                             "SETTINGS,",
                             "START_VIDEO",
+                            "REQUEST_KEYFRAME",
                             "js,",
                         ]
                         if active_mk_token and perms.get("token") == active_mk_token:
@@ -2571,6 +2586,28 @@ class DataStreamingServer(BaseStreamingService):
                             except (ConnectionResetError, OSError, RuntimeError):
                                 pass
 
+                    elif message == "REQUEST_KEYFRAME":
+                        # Client requests an IDR (e.g. decoder recreated, viewer resync).
+                        # Rate-limited per display; viewers get a stricter per-socket
+                        # throttle since any number of them can share one stream.
+                        perms = client_permissions.get(websocket)
+                        if perms and perms.get("role") == "viewer":
+                            now = time.monotonic()
+                            last = self.last_viewer_keyframe_request_times.get(websocket, 0.0)
+                            if now - last < 1.0:
+                                continue
+                            self.last_viewer_keyframe_request_times[websocket] = now
+                        target_display_id = client_display_id or 'primary'
+                        instance = self.capture_instances.get(target_display_id)
+                        module = instance.get('module') if instance else None
+                        if module and hasattr(module, 'request_idr_frame'):
+                            now = time.monotonic()
+                            if now - self._last_keyframe_request.get(target_display_id, 0.0) >= 0.25:
+                                self._last_keyframe_request[target_display_id] = now
+                                data_logger.info(f"Keyframe requested by {remote_address} for '{target_display_id}'.")
+                                # Non-blocking in pixelflux (atomic flag / channel send).
+                                module.request_idr_frame()
+
                     elif message == "START_AUDIO":
                         async def _handle_start_audio_request():
                             await self.client_settings_received.wait()
@@ -2807,6 +2844,7 @@ class DataStreamingServer(BaseStreamingService):
             )
         finally:
             self.last_start_video_request_times.pop(websocket, None)
+            self.last_viewer_keyframe_request_times.pop(websocket, None)
             client_permissions.pop(websocket, None)
             data_logger.info(f"Cleaning up Data WS handler for {raddr} (Display ID: {client_display_id})...")
 
@@ -2925,6 +2963,7 @@ class DataStreamingServer(BaseStreamingService):
             if not self.clients:
                  data_logger.info(f"Last client ({raddr}) disconnected. All pipelines should have been stopped by reconfigure_displays.")
                  self.capture_cursor = False
+                 self._last_keyframe_request.clear()
                  # shutdown_pipelines() -> reconfigure_displays() acquires
                  # _reconfigure_lock itself; it must not be held here.
                  await self.shutdown_pipelines()
