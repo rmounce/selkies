@@ -2382,8 +2382,16 @@ class DataStreamingServer(BaseStreamingService):
                                 
                                 await self.broadcast_stream_resolution()
 
-                                data_logger.info(f"Broadcasting PIPELINE_RESETTING to sync new viewer.")
-                                await _broadcast_to_clients(self.clients, "PIPELINE_RESETTING primary")
+                                # Reset only the JOINING viewer (already-decoding clients
+                                # must not be disrupted), then request an IDR so its
+                                # keyframe gate opens immediately — with an infinite GOP
+                                # there is no scheduled keyframe to wait for.
+                                data_logger.info("Sending PIPELINE_RESETTING to the new viewer and requesting an IDR.")
+                                try:
+                                    await websocket.send_str("PIPELINE_RESETTING primary")
+                                except (ConnectionResetError, OSError, RuntimeError):
+                                    pass
+                                self._schedule_idr_for_display('primary')
 
                                 continue
 
